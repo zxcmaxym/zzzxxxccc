@@ -1,3 +1,3 @@
 #!/bin/bash
-docker image rm student-api:latest
-docker image rm student-task:latest
+docker image rm school-api:latest
+docker image rm school-task:latest

@@ -1,10 +1,11 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: task-${TASK_NAME}-${TIMESTAMP}
+  name: task-${TASK_NAME}-${STUDENT_NAME}-${TIMESTAMP}
   labels:
     app: task
     task: ${TASK_NAME}
+    student: ${STUDENT_NAME}
 spec:
   containers:
     - name: task
@@ -13,15 +14,24 @@ spec:
       env:
         - name: TASK_NAME
           value: ${TASK_NAME}
-        - name: INPUT_FILE
-          value: /app/data/input.txt
-        - name: OUTPUT_FILE
-          value: /app/data/output.txt
+        - name: STUDENT_NAME
+          value: ${STUDENT_NAME}
+        - name: TEACHER_SCRIPT
+          value: /app/scripts/teacher_script.py
+        - name: STUDENT_SCRIPT
+          value: /app/scripts/student_script.py
+        - name: OUTPUT_DIR
+          value: /app/output
       volumeMounts:
-        - name: task-data
-          mountPath: /app/data
+        - name: task-scripts
+          mountPath: /app/scripts
+        - name: task-output
+          mountPath: /app/output
   volumes:
-    - name: task-data
+    - name: task-scripts
+      persistentVolumeClaim:
+        claimName: task-pvc
+    - name: task-output
       persistentVolumeClaim:
         claimName: task-pvc
   restartPolicy: Never 
