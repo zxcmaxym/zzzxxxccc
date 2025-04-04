@@ -36,6 +36,7 @@ spec:
       labels:
         app: api
     spec:
+      serviceAccountName: api-service-account
       containers:
         - name: api
           image: school-api:latest
