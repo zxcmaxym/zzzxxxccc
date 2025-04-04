@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: task-${TASK_NAME}-${TIMESTAMP}
+  labels:
+    app: task
+    task: ${TASK_NAME}
+spec:
+  containers:
+    - name: task
+      image: school-task:latest
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: TASK_NAME
+          value: ${TASK_NAME}
+        - name: INPUT_FILE
+          value: /app/data/input.txt
+        - name: OUTPUT_FILE
+          value: /app/data/output.txt
+      volumeMounts:
+        - name: task-data
+          mountPath: /app/data
+  volumes:
+    - name: task-data
+      persistentVolumeClaim:
+        claimName: task-pvc
+  restartPolicy: Never 
