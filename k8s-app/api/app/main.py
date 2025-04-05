@@ -62,9 +62,29 @@ class TaskResult(Base):
     student_id = Column(Integer, ForeignKey("students.id"))
     status = Column(String)  # SUCCESS, FAIL, ERROR
     created_at = Column(DateTime, default=datetime.utcnow)
-    teacher_output = Column(String)
-    student_output = Column(String)
-    diff_output = Column(String, nullable=True)
+    teacher_output_path = Column(String)
+    student_output_path = Column(String)
+
+class Group(Base):
+    __tablename__ = "groups"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class StudentGroup(Base):
+    __tablename__ = "student_groups"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"))
+    group_id = Column(Integer, ForeignKey("groups.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class TaskGroup(Base):
+    __tablename__ = "task_groups"
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"))
+    group_id = Column(Integer, ForeignKey("groups.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 # Pydantic Models
 class StudentBase(BaseModel):
@@ -83,11 +103,22 @@ class TaskResultBase(BaseModel):
     status: str
     teacher_output: str
     student_output: str
-    diff_output: Optional[str] = None
 
 class APIInfo(BaseModel):
     status: str
+    tasks: List[Dict[str, str]]
     endpoints: List[Dict[str, str]]
+
+class GroupBase(BaseModel):
+    name: str
+
+class StudentGroupBase(BaseModel):
+    student_name: str
+    group_name: str
+
+class TaskGroupBase(BaseModel):
+    task_name: str
+    group_name: str
 
 # Database dependency
 def get_db():
@@ -370,18 +401,24 @@ async def check_task_pods():
                         status_path = Path(f"/shared/output/{task_name}/{student_name}/status.txt")
                         
                         if output_path.exists() and status_path.exists():
-                            # Read the output file
+                            # Create result directory in API PVC
+                            result_dir = RESULTS_DIR / task_name / student_name
+                            result_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Copy output file to API PVC
+                            api_output_path = result_dir / "output.txt"
+                            shutil.copy(str(output_path), str(api_output_path))
+                            
+                            # Parse the output to extract teacher and student outputs
                             with open(output_path, "r") as f:
                                 output_content = f.read()
                             
-                            # Parse the output to extract teacher and student outputs
-                            teacher_output = ""
-                            student_output = ""
-                            diff_output = ""
-                            status = "ERROR"
-                            
                             # Split the output into sections
                             sections = output_content.split("=== ")
+                            teacher_output = ""
+                            student_output = ""
+                            status = "ERROR"
+                            
                             for section in sections:
                                 if section.startswith("Teacher's Script Output"):
                                     teacher_output = section.split("\n", 1)[1].strip()
@@ -393,9 +430,6 @@ async def check_task_pods():
                                         status = "SUCCESS"
                                     elif "FAIL" in comparison:
                                         status = "FAIL"
-                                        # Extract diff if present
-                                        if "=== Differences ===" in comparison:
-                                            diff_output = comparison.split("=== Differences ===")[1].strip()
                             
                             # Get task and student IDs
                             task = db.query(Task).filter(Task.name == task_name).first()
@@ -407,9 +441,8 @@ async def check_task_pods():
                                     task_id=task.id,
                                     student_id=student.id,
                                     status=status,
-                                    teacher_output=teacher_output,
-                                    student_output=student_output,
-                                    diff_output=diff_output
+                                    teacher_output_path=str(api_output_path),
+                                    student_output_path=str(api_output_path)
                                 )
                                 db.add(task_result)
                                 db.commit()
@@ -450,12 +483,47 @@ async def validate_student_task(
     if not task:
         raise HTTPException(status_code=400, detail="Task not found")
     
+    # Check for existing results
+    existing_result = db.query(TaskResult).filter(
+        TaskResult.task_id == task.id,
+        TaskResult.student_id == student.id
+    ).first()
+    
+    if existing_result:
+        # Delete existing result from database
+        db.delete(existing_result)
+        db.commit()
+        
+        # Delete old result files
+        result_dir = RESULTS_DIR / task_name / student_name
+        if result_dir.exists():
+            shutil.rmtree(result_dir)
+    
+    # Create a new result with STARTED status
+    task_result = TaskResult(
+        task_id=task.id,
+        student_id=student.id,
+        status="STARTED",
+        teacher_output_path="",
+        student_output_path=""
+    )
+    db.add(task_result)
+    db.commit()
+    
+    # Clean up old files and directories
+    shared_input_dir = Path(f"/shared/input/{task_name}/{student_name}")
+    if shared_input_dir.exists():
+        shutil.rmtree(shared_input_dir)
+    
+    shared_output_dir = Path(f"/shared/output/{task_name}/{student_name}")
+    if shared_output_dir.exists():
+        shutil.rmtree(shared_output_dir)
+    
     # Create directories
     student_dir = create_student_directory(student_name)
     task_dir = create_task_directory(task_name)
     
     # Save the student's script to shared input
-    shared_input_dir = Path(f"/shared/input/{task_name}/{student_name}")
     shared_input_dir.mkdir(parents=True, exist_ok=True)
     student_script_path = shared_input_dir / f"{student_name}_script.py"
     with open(student_script_path, "wb") as buffer:
@@ -467,41 +535,115 @@ async def validate_student_task(
     # Create and start task pod
     pod_name = create_task_pod(task_name, student_name, db, shared_pvc_name)
     if not pod_name:
+        # If pod creation fails, update status to ERROR
+        task_result.status = "ERROR"
+        db.commit()
         raise HTTPException(status_code=500, detail="Failed to create task pod")
     
     # Return information about the task
     return {
         "message": "Task validation started",
         "pod_name": pod_name,
-        "status_url": f"/student/task/status/{pod_name}"
+        "result_url": f"/student/task/result/{task_name}/{student_name}"
     }
 
-# Add a new endpoint to check task status
-@app.get("/student/task/status/{pod_name}")
-def get_task_status(pod_name: str):
-    status = check_task_pod_status(pod_name)
-    return {
-        "pod_name": pod_name,
-        "status": status["phase"],
-        "completed": status["completed"],
-        "result": status["result"]
-    }
+@app.get("/student/task/result/{task_name}/{student_name}")
+def get_task_result(task_name: str, student_name: str, db: Session = Depends(get_db)):
+    # Validate student
+    student = db.query(Student).filter(Student.name == student_name).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    # Validate task
+    task = db.query(Task).filter(Task.name == task_name).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Get most recent task result from database
+    task_result = db.query(TaskResult).filter(
+        TaskResult.task_id == task.id,
+        TaskResult.student_id == student.id
+    ).order_by(TaskResult.created_at.desc()).first()
+    
+    if not task_result:
+        return {
+            "status": "NOT_STARTED",
+            "output": None
+        }
+    
+    # Read the output file
+    output_path = Path(f"/shared/output/{task_name}/{student_name}/output.txt")
+    if not output_path.exists():
+        return {
+            "status": task_result.status,
+            "output": None
+        }
+    
+    try:
+        with open(output_path, "r") as f:
+            output_content = f.read()
+        return {
+            "status": task_result.status,
+            "output": output_content
+        }
+    except Exception as e:
+        return {
+            "status": task_result.status,
+            "output": None,
+            "error": str(e)
+        }
 
 @app.get("/student", response_model=APIInfo)
-def get_student_info():
-    endpoints = [
-        {"path": "/student/validate", "description": "Upload and validate a student task"},
-        {"path": "/student/task/result/{task}/{name}", "description": "Get task results for a student"},
-        {"path": "/student/task/{task}", "description": "Get task information"}
-    ]
+def get_student_info(name: str, db: Session = Depends(get_db)):
+    # Validate student
+    student = db.query(Student).filter(Student.name == name).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    # Get student's groups
+    student_groups = db.query(StudentGroup).filter(StudentGroup.student_id == student.id).all()
+    group_ids = [sg.group_id for sg in student_groups]
+    
+    # Get tasks assigned to these groups
+    task_groups = db.query(TaskGroup).filter(TaskGroup.group_id.in_(group_ids)).all()
+    task_ids = [tg.task_id for tg in task_groups]
+    
+    # Get task details
+    tasks = db.query(Task).filter(Task.id.in_(task_ids)).all()
+    
+    # Get most recent results for these tasks
+    results = db.query(TaskResult).filter(
+        TaskResult.task_id.in_(task_ids),
+        TaskResult.student_id == student.id
+    ).order_by(TaskResult.created_at.desc()).all()
+    
+    # Create result map for quick lookup (most recent result for each task)
+    result_map = {}
+    for r in results:
+        if r.task_id not in result_map:  # Only keep the first (most recent) result for each task
+            result_map[r.task_id] = r.status
+    
+    # Format task information
+    task_info = []
+    for task in tasks:
+        task_info.append({
+            "name": task.name,
+            "description": task.description,
+            "status": result_map.get(task.id, "NOT_STARTED")
+        })
     
     return APIInfo(
         status="active",
-        endpoints=endpoints
+        tasks=task_info,
+        endpoints=[
+            {"path": "/student/validate", "description": "Upload and validate a student task"},
+            {"path": "/student/task/result/{task}/{name}", "description": "Get task result for a student"},
+            {"path": "/student/task/{task}", "description": "Get task information"}
+        ]
     )
 
-@app.get("/student/task/result/{task}/{name}")
-def get_task_result(task: str, name: str, db: Session = Depends(get_db)):
+@app.get("/student/task/{task}")
+def get_task(task: str, name: str, db: Session = Depends(get_db)):
     # Validate student
     student = db.query(Student).filter(Student.name == name).first()
     if not student:
@@ -512,29 +654,17 @@ def get_task_result(task: str, name: str, db: Session = Depends(get_db)):
     if not task_obj:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    # Get result from database
-    result = db.query(TaskResult).filter(
-        TaskResult.task_id == task_obj.id,
-        TaskResult.student_id == student.id
+    # Check if student has access to this task
+    student_groups = db.query(StudentGroup).filter(StudentGroup.student_id == student.id).all()
+    group_ids = [sg.group_id for sg in student_groups]
+    
+    task_groups = db.query(TaskGroup).filter(
+        TaskGroup.task_id == task_obj.id,
+        TaskGroup.group_id.in_(group_ids)
     ).first()
     
-    if not result:
-        raise HTTPException(status_code=404, detail="Result not found")
-    
-    return {
-        "status": result.status,
-        "teacher_output": result.teacher_output,
-        "student_output": result.student_output,
-        "diff_output": result.diff_output,
-        "created_at": result.created_at
-    }
-
-@app.get("/student/task/{task}")
-def get_task(task: str, db: Session = Depends(get_db)):
-    # Validate task
-    task_obj = db.query(Task).filter(Task.name == task).first()
-    if not task_obj:
-        raise HTTPException(status_code=404, detail="Task not found")
+    if not task_groups:
+        raise HTTPException(status_code=403, detail="You don't have access to this task")
     
     # Check if task directory exists
     task_dir = TASKS_DIR / task
@@ -544,11 +674,18 @@ def get_task(task: str, db: Session = Depends(get_db)):
     # Get task files
     task_files = [f.name for f in task_dir.iterdir() if f.is_file()]
     
+    # Get most recent result if exists
+    result = db.query(TaskResult).filter(
+        TaskResult.task_id == task_obj.id,
+        TaskResult.student_id == student.id
+    ).order_by(TaskResult.created_at.desc()).first()
+    
     return {
         "name": task,
         "description": task_obj.description,
         "files": task_files,
-        "path": str(task_dir)
+        "path": str(task_dir),
+        "status": result.status if result else "NOT_STARTED"
     }
 
 @app.post("/teacher/task/create")
@@ -556,6 +693,7 @@ async def create_task(
     task_name: str = Form(...),
     description: str = Form(...),
     teacher_name: str = Form(...),
+    group_names: List[str] = Form(...),
     script_file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
@@ -598,6 +736,25 @@ async def create_task(
     compare_script_path = shared_script_dir / "compare_scripts.sh"
     shutil.copy(str(script_template_path), str(compare_script_path))
     compare_script_path.chmod(0o755)  # Make the script executable
+    
+    # Assign task to groups
+    for group_name in group_names:
+        # Validate group
+        group = db.query(Group).filter(
+            Group.name == group_name,
+            Group.teacher_id == teacher.id
+        ).first()
+        if not group:
+            raise HTTPException(status_code=404, detail=f"Group {group_name} not found")
+        
+        # Create task-group association
+        db_task_group = TaskGroup(
+            task_id=db_task.id,
+            group_id=group.id
+        )
+        db.add(db_task_group)
+    
+    db.commit()
     
     return {
         "message": "Task created successfully",
@@ -642,16 +799,6 @@ def delete_task(task: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Task not found")
     
     try:
-        # Delete container if it exists
-        if task_obj.container_name:
-            try:
-                apps_v1.delete_namespaced_deployment(
-                    name=task_obj.container_name,
-                    namespace="default"
-                )
-            except:
-                pass
-        
         # Delete task directory
         task_dir = TASKS_DIR / task
         if task_dir.exists():
@@ -662,22 +809,36 @@ def delete_task(task: str, db: Session = Depends(get_db)):
         if results_dir.exists():
             shutil.rmtree(results_dir)
         
-        # Delete PVCs for this task
-        # We need to find all PVCs related to this task
-        pvcs = v1.list_namespaced_persistent_volume_claim(
+        # Delete shared directories
+        shared_task_dir = Path(f"/shared/input/{task}")
+        if shared_task_dir.exists():
+            shutil.rmtree(shared_task_dir)
+        
+        shared_output_dir = Path(f"/shared/output/{task}")
+        if shared_output_dir.exists():
+            shutil.rmtree(shared_output_dir)
+        
+        # Delete any running task pods for this task
+        pods = v1.list_namespaced_pod(
             namespace="default",
-            label_selector=f"task={task}"
+            label_selector=f"app=task,task={task}"
         )
-        for pvc in pvcs.items:
+        for pod in pods.items:
             try:
-                v1.delete_namespaced_persistent_volume_claim(
-                    name=pvc.metadata.name,
+                v1.delete_namespaced_pod(
+                    name=pod.metadata.name,
                     namespace="default"
                 )
             except:
                 pass
         
-        # Delete from database
+        # Delete task results from database
+        db.query(TaskResult).filter(TaskResult.task_id == task_obj.id).delete()
+        
+        # Delete task groups first
+        db.query(TaskGroup).filter(TaskGroup.task_id == task_obj.id).delete()
+        
+        # Delete task from database
         db.delete(task_obj)
         db.commit()
         
@@ -723,4 +884,105 @@ def get_teacher_task(task: str, db: Session = Depends(get_db)):
         "container_status": container_status,
         "result_count": result_count,
         "path": str(task_dir)
-    } 
+    }
+
+@app.post("/teacher/group/create")
+def create_group(group_name: str = Form(...), teacher_name: str = Form(...), db: Session = Depends(get_db)):
+    # Validate teacher
+    teacher = db.query(Teacher).filter(Teacher.name == teacher_name).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    
+    # Create group
+    db_group = Group(
+        name=group_name,
+        teacher_id=teacher.id
+    )
+    db.add(db_group)
+    db.commit()
+    db.refresh(db_group)
+    
+    return {"message": "Group created successfully", "group_id": db_group.id}
+
+@app.post("/teacher/group/add-student")
+def add_student_to_group(student_group: StudentGroupBase, teacher_name: str, db: Session = Depends(get_db)):
+    # Validate teacher
+    teacher = db.query(Teacher).filter(Teacher.name == teacher_name).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    
+    # Validate student
+    student = db.query(Student).filter(Student.name == student_group.student_name).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    # Validate group
+    group = db.query(Group).filter(
+        Group.name == student_group.group_name,
+        Group.teacher_id == teacher.id
+    ).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check if student is already in group
+    existing = db.query(StudentGroup).filter(
+        StudentGroup.student_id == student.id,
+        StudentGroup.group_id == group.id
+    ).first()
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="Student is already in this group")
+    
+    # Add student to group
+    db_student_group = StudentGroup(
+        student_id=student.id,
+        group_id=group.id
+    )
+    db.add(db_student_group)
+    db.commit()
+    
+    return {"message": "Student added to group successfully"}
+
+@app.get("/teacher/group/{group}/students")
+def get_group_students(group: str, teacher_name: str, db: Session = Depends(get_db)):
+    # Validate teacher
+    teacher = db.query(Teacher).filter(Teacher.name == teacher_name).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    
+    # Validate group
+    group_obj = db.query(Group).filter(
+        Group.name == group,
+        Group.teacher_id == teacher.id
+    ).first()
+    if not group_obj:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Get students in group
+    student_groups = db.query(StudentGroup).filter(StudentGroup.group_id == group_obj.id).all()
+    student_ids = [sg.student_id for sg in student_groups]
+    students = db.query(Student).filter(Student.id.in_(student_ids)).all()
+    
+    return [{"name": student.name} for student in students]
+
+@app.get("/teacher/group/{group}/tasks")
+def get_group_tasks(group: str, teacher_name: str, db: Session = Depends(get_db)):
+    # Validate teacher
+    teacher = db.query(Teacher).filter(Teacher.name == teacher_name).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    
+    # Validate group
+    group_obj = db.query(Group).filter(
+        Group.name == group,
+        Group.teacher_id == teacher.id
+    ).first()
+    if not group_obj:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Get tasks assigned to group
+    task_groups = db.query(TaskGroup).filter(TaskGroup.group_id == group_obj.id).all()
+    task_ids = [tg.task_id for tg in task_groups]
+    tasks = db.query(Task).filter(Task.id.in_(task_ids)).all()
+    
+    return [{"name": task.name, "description": task.description} for task in tasks] 

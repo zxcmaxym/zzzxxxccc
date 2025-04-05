@@ -15,7 +15,7 @@ minikube image rm school-task:latest
 ../delimg.sh
 ./create.sh
 kubectl apply -f ../k8s/api-deployment.yaml
-sleep 4 
+sleep 20
 
 # Start new port-forward in background and save PID
 kubectl port-forward $(kubectl get pods --no-headers -o custom-columns=":metadata.name" | grep '^api-' | head -n 1) 6969:8000 &
