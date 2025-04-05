@@ -3,13 +3,25 @@
 # Create output directory
 mkdir -p "/shared/output/$TASK_NAME/$STUDENT_NAME"
 
-# Run teacher's script and capture output
-TEACHER_OUTPUT=$(python3 "/shared/input/$TASK_NAME/teacher/teacher_script.py" 2>&1)
-TEACHER_EXIT_CODE=$?
+# Check if vars.txt exists and is not empty
+VARS_FILE="/shared/input/$TASK_NAME/$STUDENT_NAME/vars.txt"
+if [ -s "$VARS_FILE" ]; then
+    # Run teacher's script with all inputs
+    TEACHER_OUTPUT=$(python3 "/shared/input/$TASK_NAME/teacher/teacher_script.py" < "$VARS_FILE" 2>&1)
+    TEACHER_EXIT_CODE=$?
+    
+    # Run student's script with all inputs
+    STUDENT_OUTPUT=$(python3 "/shared/input/$TASK_NAME/$STUDENT_NAME/${STUDENT_NAME}_script.py" < "$VARS_FILE" 2>&1)
+    STUDENT_EXIT_CODE=$?
+else
+    # Run teacher's script without input
+    TEACHER_OUTPUT=$(python3 "/shared/input/$TASK_NAME/teacher/teacher_script.py" 2>&1)
+    TEACHER_EXIT_CODE=$?
 
-# Run student's script and capture output
-STUDENT_OUTPUT=$(python3 "/shared/input/$TASK_NAME/$STUDENT_NAME/${STUDENT_NAME}_script.py" 2>&1)
-STUDENT_EXIT_CODE=$?
+    # Run student's script without input
+    STUDENT_OUTPUT=$(python3 "/shared/input/$TASK_NAME/$STUDENT_NAME/${STUDENT_NAME}_script.py" 2>&1)
+    STUDENT_EXIT_CODE=$?
+fi
 
 # Compare outputs and write results
 {

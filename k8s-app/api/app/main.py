@@ -14,6 +14,7 @@ from pathlib import Path
 import time
 import asyncio
 import yaml
+import random
 
 app = FastAPI()
 
@@ -303,48 +304,6 @@ def run_validation_script(task_name: str, student_name: str, file_path: Path) ->
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-def check_task_pod_status(pod_name: str) -> Dict[str, Any]:
-    try:
-        pod = v1.read_namespaced_pod(name=pod_name, namespace="default")
-        status = {
-            "phase": pod.status.phase,
-            "completed": False,
-            "result": None
-        }
-        
-        if pod.status.phase == "Succeeded" or pod.status.phase == "Failed":
-            # Check if output files exist
-            try:
-                # Try to cat the status file
-                result = v1.read_namespaced_pod_exec(
-                    name=pod_name,
-                    namespace="default",
-                    command=["cat", "/app/output/status.txt"]
-                )
-                if result and "COMPLETED" in result:
-                    status["completed"] = True
-                    # Get results
-                    try:
-                        result_text = v1.read_namespaced_pod_exec(
-                            name=pod_name,
-                            namespace="default",
-                            command=["cat", "/app/output/result.txt"]
-                        )
-                        status["result"] = result_text.strip()
-                    except:
-                        status["result"] = "ERROR"
-            except:
-                # If we can't exec into the pod (e.g. it's completed but container terminated)
-                # we consider it completed but with an error
-                if pod.status.phase == "Succeeded":
-                    status["completed"] = True
-                    status["result"] = "ERROR"
-        
-        return status
-    except Exception as e:
-        print(f"Error checking pod status: {str(e)}")
-        return {"phase": "Unknown", "completed": False, "result": None}
-
 def collect_task_results(pod_name: str, task_name: str, student_name: str) -> Dict[str, str]:
     try:
         # Create result directory
@@ -378,93 +337,25 @@ def collect_task_results(pod_name: str, task_name: str, student_name: str) -> Di
         print(f"Error collecting task results: {str(e)}")
         return {}
 
-# Background task to check and collect results
-async def check_task_pods():
-    while True:
-        try:
-            db = SessionLocal()
-            # Get all running task pods
-            pods = v1.list_namespaced_pod(
-                namespace="default",
-                label_selector="app=task"
-            )
-            
-            for pod in pods.items:
-                task_name = pod.metadata.labels.get("task")
-                student_name = pod.metadata.labels.get("student")
-                
-                if task_name and student_name:
-                    # Check if pod has completed
-                    if pod.status.phase == "Succeeded" or pod.status.phase == "Failed":
-                        # Read the output file
-                        output_path = Path(f"/shared/output/{task_name}/{student_name}/output.txt")
-                        status_path = Path(f"/shared/output/{task_name}/{student_name}/status.txt")
-                        
-                        if output_path.exists() and status_path.exists():
-                            # Create result directory in API PVC
-                            result_dir = RESULTS_DIR / task_name / student_name
-                            result_dir.mkdir(parents=True, exist_ok=True)
-                            
-                            # Copy output file to API PVC
-                            api_output_path = result_dir / "output.txt"
-                            shutil.copy(str(output_path), str(api_output_path))
-                            
-                            # Parse the output to extract teacher and student outputs
-                            with open(output_path, "r") as f:
-                                output_content = f.read()
-                            
-                            # Split the output into sections
-                            sections = output_content.split("=== ")
-                            teacher_output = ""
-                            student_output = ""
-                            status = "ERROR"
-                            
-                            for section in sections:
-                                if section.startswith("Teacher's Script Output"):
-                                    teacher_output = section.split("\n", 1)[1].strip()
-                                elif section.startswith("Student's Script Output"):
-                                    student_output = section.split("\n", 1)[1].strip()
-                                elif section.startswith("Comparison Results"):
-                                    comparison = section.split("\n", 1)[1].strip()
-                                    if "SUCCESS" in comparison:
-                                        status = "SUCCESS"
-                                    elif "FAIL" in comparison:
-                                        status = "FAIL"
-                            
-                            # Get task and student IDs
-                            task = db.query(Task).filter(Task.name == task_name).first()
-                            student = db.query(Student).filter(Student.name == student_name).first()
-                            
-                            if task and student:
-                                # Create or update task result
-                                task_result = TaskResult(
-                                    task_id=task.id,
-                                    student_id=student.id,
-                                    status=status,
-                                    teacher_output_path=str(api_output_path),
-                                    student_output_path=str(api_output_path)
-                                )
-                                db.add(task_result)
-                                db.commit()
-                            
-                            # Delete the pod
-                            try:
-                                v1.delete_namespaced_pod(
-                                    name=pod.metadata.name,
-                                    namespace="default"
-                                )
-                            except Exception as e:
-                                print(f"Error deleting pod {pod.metadata.name}: {str(e)}")
-            
-            db.close()
-        except Exception as e:
-            print(f"Error in check_task_pods: {str(e)}")
-        
-        await asyncio.sleep(30)  # Check every 30 seconds
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(check_task_pods())
+def randomize_variables(task_name: str) -> List[int]:
+    """Read variables from vars.txt and generate random values within the specified ranges."""
+    vars_path = TASKS_DIR / task_name / "vars.txt"
+    if not vars_path.exists():
+        return []
+    
+    random_values = []
+    with open(vars_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                start, end = map(int, line.split("-"))
+                random_values.append(random.randint(start, end))
+            except ValueError:
+                continue
+    
+    return random_values
 
 @app.post("/student/validate")
 async def validate_student_task(
@@ -482,6 +373,25 @@ async def validate_student_task(
     task = db.query(Task).filter(Task.name == task_name).first()
     if not task:
         raise HTTPException(status_code=400, detail="Task not found")
+    
+    # Validate script file is a Python file
+    if not script_file.filename.endswith('.py'):
+        raise HTTPException(status_code=400, detail="Script file must be a Python file (.py)")
+    
+    # Check if student has access to this task through their groups
+    student_groups = db.query(StudentGroup).filter(StudentGroup.student_id == student.id).all()
+    group_ids = [sg.group_id for sg in student_groups]
+    
+    task_groups = db.query(TaskGroup).filter(
+        TaskGroup.task_id == task.id,
+        TaskGroup.group_id.in_(group_ids)
+    ).first()
+    
+    if not task_groups:
+        raise HTTPException(status_code=403, detail="You don't have access to this task")
+    
+    # Generate random values for variables
+    random_values = randomize_variables(task_name)
     
     # Check for existing results
     existing_result = db.query(TaskResult).filter(
@@ -529,6 +439,12 @@ async def validate_student_task(
     with open(student_script_path, "wb") as buffer:
         shutil.copyfileobj(script_file.file, buffer)
     
+    # Save random values to vars.txt in shared directory
+    if random_values:
+        vars_path = shared_input_dir / "vars.txt"
+        with open(vars_path, "w") as f:
+            f.write("\n".join(map(str, random_values)))
+    
     # Create shared PVC
     shared_pvc_name = create_shared_pvc()
     
@@ -559,6 +475,18 @@ def get_task_result(task_name: str, student_name: str, db: Session = Depends(get
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
+    # Check if student has access to this task through their groups
+    student_groups = db.query(StudentGroup).filter(StudentGroup.student_id == student.id).all()
+    group_ids = [sg.group_id for sg in student_groups]
+    
+    task_groups = db.query(TaskGroup).filter(
+        TaskGroup.task_id == task.id,
+        TaskGroup.group_id.in_(group_ids)
+    ).first()
+    
+    if not task_groups:
+        raise HTTPException(status_code=403, detail="You don't have access to this task")
+    
     # Get most recent task result from database
     task_result = db.query(TaskResult).filter(
         TaskResult.task_id == task.id,
@@ -567,7 +495,7 @@ def get_task_result(task_name: str, student_name: str, db: Session = Depends(get
     
     if not task_result:
         return {
-            "status": "NOT_STARTED",
+            "result": "NOT_STARTED",
             "output": None
         }
     
@@ -575,7 +503,7 @@ def get_task_result(task_name: str, student_name: str, db: Session = Depends(get
     output_path = Path(f"/shared/output/{task_name}/{student_name}/output.txt")
     if not output_path.exists():
         return {
-            "status": task_result.status,
+            "result": task_result.status,
             "output": None
         }
     
@@ -583,12 +511,12 @@ def get_task_result(task_name: str, student_name: str, db: Session = Depends(get
         with open(output_path, "r") as f:
             output_content = f.read()
         return {
-            "status": task_result.status,
+            "result": task_result.status,  # SUCCESS, FAIL, ERROR, or NOT_STARTED
             "output": output_content
         }
     except Exception as e:
         return {
-            "status": task_result.status,
+            "result": task_result.status,
             "output": None,
             "error": str(e)
         }
@@ -629,7 +557,7 @@ def get_student_info(name: str, db: Session = Depends(get_db)):
         task_info.append({
             "name": task.name,
             "description": task.description,
-            "status": result_map.get(task.id, "NOT_STARTED")
+            "result": result_map.get(task.id, "NOT_STARTED")  # SUCCESS, FAIL, ERROR, or NOT_STARTED
         })
     
     return APIInfo(
@@ -695,12 +623,22 @@ async def create_task(
     teacher_name: str = Form(...),
     group_names: List[str] = Form(...),
     script_file: UploadFile = File(...),
+    variables_file: UploadFile = File(None),  # New optional file upload
     db: Session = Depends(get_db)
 ):
     # Validate teacher
     teacher = db.query(Teacher).filter(Teacher.name == teacher_name).first()
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
+    
+    # Check if task with same name already exists
+    existing_task = db.query(Task).filter(Task.name == task_name).first()
+    if existing_task:
+        raise HTTPException(status_code=400, detail="A task with this name already exists")
+    
+    # Validate script file is a Python file
+    if not script_file.filename.endswith('.py'):
+        raise HTTPException(status_code=400, detail="Script file must be a Python file (.py)")
     
     # Create task in database
     db_task = Task(
@@ -720,6 +658,12 @@ async def create_task(
     script_path = task_dir / "teacher_script.py"
     with open(script_path, "wb") as buffer:
         shutil.copyfileobj(script_file.file, buffer)
+    
+    # Save the variables file if provided
+    if variables_file:
+        vars_path = task_dir / "vars.txt"
+        with open(vars_path, "wb") as buffer:
+            shutil.copyfileobj(variables_file.file, buffer)
     
     # Create shared directories for the task
     shared_script_dir = Path(f"/shared/input/{task_name}/script")
@@ -762,16 +706,21 @@ async def create_task(
     }
 
 @app.get("/teacher", response_model=APIInfo)
-def get_teacher_info():
+def get_teacher_info(db: Session = Depends(get_db)):
     endpoints = [
         {"path": "/teacher/task/create", "description": "Create a new task"},
         {"path": "/teacher/task/results/{task}", "description": "Get results for a task"},
         {"path": "/teacher/task/delete/{task}", "description": "Delete a task"},
-        {"path": "/teacher/task/{task}", "description": "Get task information"}
+        {"path": "/teacher/task/{task}", "description": "Get task information"},
+        {"path": "/teacher/group/create", "description": "Create a new group"},
+        {"path": "/teacher/group/add-student", "description": "Add a student to a group"},
+        {"path": "/teacher/group/{group}/students", "description": "Get students in a group"},
+        {"path": "/teacher/group/{group}/tasks", "description": "Get tasks assigned to a group"}
     ]
     
     return APIInfo(
         status="active",
+        tasks=[],  # Empty list since this endpoint doesn't return any tasks
         endpoints=endpoints
     )
 
@@ -787,7 +736,7 @@ def get_task_results(task: str, db: Session = Depends(get_db)):
     
     return [{
         "student_name": db.query(Student).filter(Student.id == r.student_id).first().name,
-        "status": r.status,
+        "result": r.status,  # SUCCESS, FAIL, ERROR, or NOT_STARTED
         "created_at": r.created_at
     } for r in results]
 
@@ -858,18 +807,8 @@ def get_teacher_task(task: str, db: Session = Depends(get_db)):
     if not task_dir.exists():
         raise HTTPException(status_code=404, detail="Task directory not found")
     
-    # Check if validation script exists
-    validation_script = task_dir / "validate.sh"
-    script_exists = validation_script.exists()
-    
-    # Check container status
-    container_status = "not_created"
-    if task_obj.container_name:
-        try:
-            pod = v1.read_namespaced_pod(name=task_obj.container_name, namespace="default")
-            container_status = pod.status.phase
-        except:
-            container_status = "not_found"
+    # Get task files
+    task_files = [f.name for f in task_dir.iterdir() if f.is_file()]
     
     # Count results
     results_dir = RESULTS_DIR / task
@@ -880,8 +819,7 @@ def get_teacher_task(task: str, db: Session = Depends(get_db)):
     return {
         "name": task,
         "description": task_obj.description,
-        "script_exists": script_exists,
-        "container_status": container_status,
+        "files": task_files,
         "result_count": result_count,
         "path": str(task_dir)
     }
@@ -892,6 +830,15 @@ def create_group(group_name: str = Form(...), teacher_name: str = Form(...), db:
     teacher = db.query(Teacher).filter(Teacher.name == teacher_name).first()
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
+    
+    # Check if group already exists
+    existing_group = db.query(Group).filter(
+        Group.name == group_name,
+        Group.teacher_id == teacher.id
+    ).first()
+    
+    if existing_group:
+        raise HTTPException(status_code=400, detail="A group with this name already exists")
     
     # Create group
     db_group = Group(
@@ -985,4 +932,4 @@ def get_group_tasks(group: str, teacher_name: str, db: Session = Depends(get_db)
     task_ids = [tg.task_id for tg in task_groups]
     tasks = db.query(Task).filter(Task.id.in_(task_ids)).all()
     
-    return [{"name": task.name, "description": task.description} for task in tasks] 
+    return [{"name": task.name, "description": task.description} for task in tasks]

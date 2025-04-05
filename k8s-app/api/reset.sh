@@ -12,6 +12,8 @@ kubectl delete deployment api
 sleep 2
 minikube image rm school-api:latest
 minikube image rm school-task:latest
+kubectl delete pvc shared-pvc
+kubectl apply -f ../k8s/shared-pvc.yaml
 ../delimg.sh
 ./create.sh
 kubectl apply -f ../k8s/api-deployment.yaml
