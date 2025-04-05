@@ -130,7 +130,36 @@ def create_teacher_directory(teacher_name: str) -> Path:
     teacher_dir.mkdir(parents=True, exist_ok=True)
     return teacher_dir
 
-def create_task_pod(task_name: str, student_name: str, db: Session, scripts_pvc_name: str, output_pvc_name: str) -> str:
+def create_shared_pvc() -> str:
+    """Create a shared PVC for input and output."""
+    shared_pvc_name = "shared-pvc"
+    shared_pvc = {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": shared_pvc_name,
+            "namespace": "default"
+        },
+        "spec": {
+            "accessModes": ["ReadWriteMany"],
+            "resources": {
+                "requests": {
+                    "storage": "1Gi"
+                }
+            },
+            "storageClassName": "standard"
+        }
+    }
+    
+    # Create the shared PVC
+    try:
+        v1.create_namespaced_persistent_volume_claim(namespace="default", body=shared_pvc)
+        return shared_pvc_name
+    except Exception as e:
+        print(f"Error creating shared PVC: {str(e)}")
+        return shared_pvc_name  # Assume it exists if creation fails
+
+def create_task_pod(task_name: str, student_name: str, db: Session, shared_pvc_name: str) -> str:
     try:
         # Generate unique pod name that follows Kubernetes naming conventions
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -176,32 +205,21 @@ spec:
   containers:
     - name: task
       image: python:3.9-slim
-      imagePullPolicy: Never
+      imagePullPolicy: IfNotPresent
       command: ["/bin/sh"]
-      args: ["-c", "mkdir -p /app/scripts /app/output && while true; do sleep 3600; done"]
+      args: ["-c", "/shared/input/{task_name}/script/compare_scripts.sh"]
       env:
         - name: TASK_NAME
           value: {task_name}
         - name: STUDENT_NAME
           value: {student_name}
-        - name: TEACHER_SCRIPT
-          value: /app/scripts/teacher_script.py
-        - name: STUDENT_SCRIPT
-          value: /app/scripts/student_script.py
-        - name: OUTPUT_DIR
-          value: /app/output
       volumeMounts:
-        - name: task-scripts
-          mountPath: /app/scripts
-        - name: task-output
-          mountPath: /app/output
+        - name: shared-volume
+          mountPath: /shared
   volumes:
-    - name: task-scripts
+    - name: shared-volume
       persistentVolumeClaim:
-        claimName: {scripts_pvc_name}
-    - name: task-output
-      persistentVolumeClaim:
-        claimName: {output_pvc_name}
+        claimName: {shared_pvc_name}
   restartPolicy: Never
 """
         
@@ -263,28 +281,37 @@ def check_task_pod_status(pod_name: str) -> Dict[str, Any]:
             "result": None
         }
         
-        if pod.status.phase == "Succeeded":
+        if pod.status.phase == "Succeeded" or pod.status.phase == "Failed":
             # Check if output files exist
             try:
+                # Try to cat the status file
                 result = v1.read_namespaced_pod_exec(
                     name=pod_name,
                     namespace="default",
                     command=["cat", "/app/output/status.txt"]
                 )
-                if "COMPLETED" in result:
+                if result and "COMPLETED" in result:
                     status["completed"] = True
                     # Get results
-                    result = v1.read_namespaced_pod_exec(
-                        name=pod_name,
-                        namespace="default",
-                        command=["cat", "/app/output/result.txt"]
-                    )
-                    status["result"] = result.strip()
+                    try:
+                        result_text = v1.read_namespaced_pod_exec(
+                            name=pod_name,
+                            namespace="default",
+                            command=["cat", "/app/output/result.txt"]
+                        )
+                        status["result"] = result_text.strip()
+                    except:
+                        status["result"] = "ERROR"
             except:
-                pass
+                # If we can't exec into the pod (e.g. it's completed but container terminated)
+                # we consider it completed but with an error
+                if pod.status.phase == "Succeeded":
+                    status["completed"] = True
+                    status["result"] = "ERROR"
         
         return status
-    except:
+    except Exception as e:
+        print(f"Error checking pod status: {str(e)}")
         return {"phase": "Unknown", "completed": False, "result": None}
 
 def collect_task_results(pod_name: str, task_name: str, student_name: str) -> Dict[str, str]:
@@ -336,26 +363,65 @@ async def check_task_pods():
                 student_name = pod.metadata.labels.get("student")
                 
                 if task_name and student_name:
-                    status = check_task_pod_status(pod.metadata.name)
-                    if status["completed"]:
-                        # Collect results
-                        results = collect_task_results(pod.metadata.name, task_name, student_name)
+                    # Check if pod has completed
+                    if pod.status.phase == "Succeeded" or pod.status.phase == "Failed":
+                        # Read the output file
+                        output_path = Path(f"/shared/output/{task_name}/{student_name}/output.txt")
+                        status_path = Path(f"/shared/output/{task_name}/{student_name}/status.txt")
                         
-                        # Update database
-                        task = db.query(Task).filter(Task.name == task_name).first()
-                        student = db.query(Student).filter(Student.name == student_name).first()
-                        
-                        if task and student:
-                            task_result = TaskResult(
-                                task_id=task.id,
-                                student_id=student.id,
-                                status=results.get("result.txt", "ERROR").strip(),
-                                teacher_output=results.get("teacher_output.txt", ""),
-                                student_output=results.get("student_output.txt", ""),
-                                diff_output=results.get("diff.txt", "")
-                            )
-                            db.add(task_result)
-                            db.commit()
+                        if output_path.exists() and status_path.exists():
+                            # Read the output file
+                            with open(output_path, "r") as f:
+                                output_content = f.read()
+                            
+                            # Parse the output to extract teacher and student outputs
+                            teacher_output = ""
+                            student_output = ""
+                            diff_output = ""
+                            status = "ERROR"
+                            
+                            # Split the output into sections
+                            sections = output_content.split("=== ")
+                            for section in sections:
+                                if section.startswith("Teacher's Script Output"):
+                                    teacher_output = section.split("\n", 1)[1].strip()
+                                elif section.startswith("Student's Script Output"):
+                                    student_output = section.split("\n", 1)[1].strip()
+                                elif section.startswith("Comparison Results"):
+                                    comparison = section.split("\n", 1)[1].strip()
+                                    if "SUCCESS" in comparison:
+                                        status = "SUCCESS"
+                                    elif "FAIL" in comparison:
+                                        status = "FAIL"
+                                        # Extract diff if present
+                                        if "=== Differences ===" in comparison:
+                                            diff_output = comparison.split("=== Differences ===")[1].strip()
+                            
+                            # Get task and student IDs
+                            task = db.query(Task).filter(Task.name == task_name).first()
+                            student = db.query(Student).filter(Student.name == student_name).first()
+                            
+                            if task and student:
+                                # Create or update task result
+                                task_result = TaskResult(
+                                    task_id=task.id,
+                                    student_id=student.id,
+                                    status=status,
+                                    teacher_output=teacher_output,
+                                    student_output=student_output,
+                                    diff_output=diff_output
+                                )
+                                db.add(task_result)
+                                db.commit()
+                            
+                            # Delete the pod
+                            try:
+                                v1.delete_namespaced_pod(
+                                    name=pod.metadata.name,
+                                    namespace="default"
+                                )
+                            except Exception as e:
+                                print(f"Error deleting pod {pod.metadata.name}: {str(e)}")
             
             db.close()
         except Exception as e:
@@ -366,85 +432,6 @@ async def check_task_pods():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(check_task_pods())
-
-def create_task_pvcs(task_name: str, student_name: str) -> tuple[str, str]:
-    """Create PVCs for a task and return their names."""
-    # Sanitize names for PVC
-    sanitized_task_name = ''.join(c.lower() if c.isalnum() else '-' for c in task_name)
-    sanitized_student_name = ''.join(c.lower() if c.isalnum() else '-' for c in student_name)
-    
-    # Ensure the name starts and ends with alphanumeric characters
-    sanitized_task_name = sanitized_task_name.strip('-')
-    sanitized_student_name = sanitized_student_name.strip('-')
-    
-    # If sanitized names are empty, use a default value
-    if not sanitized_task_name:
-        sanitized_task_name = "task"
-    if not sanitized_student_name:
-        sanitized_student_name = "student"
-    
-    # Generate unique PVC names
-    scripts_pvc_name = f"task-scripts-{sanitized_task_name}-{sanitized_student_name}"
-    output_pvc_name = f"task-output-{sanitized_task_name}-{sanitized_student_name}"
-    
-    # Create PVCs for this task
-    scripts_pvc = {
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": {
-            "name": scripts_pvc_name,
-            "namespace": "default"
-        },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {
-                "requests": {
-                    "storage": "1Gi"
-                }
-            },
-            "storageClassName": "standard"
-        }
-    }
-    
-    output_pvc = {
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": {
-            "name": output_pvc_name,
-            "namespace": "default"
-        },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {
-                "requests": {
-                    "storage": "1Gi"
-                }
-            },
-            "storageClassName": "standard"
-        }
-    }
-    
-    # Create the PVCs
-    try:
-        v1.create_namespaced_persistent_volume_claim(namespace="default", body=scripts_pvc)
-        v1.create_namespaced_persistent_volume_claim(namespace="default", body=output_pvc)
-        return scripts_pvc_name, output_pvc_name
-    except Exception as e:
-        print(f"Error creating PVCs: {str(e)}")
-        # If PVCs already exist, return their names
-        return scripts_pvc_name, output_pvc_name
-
-def delete_task_pvcs(scripts_pvc_name: str, output_pvc_name: str):
-    """Delete PVCs for a task."""
-    try:
-        v1.delete_namespaced_persistent_volume_claim(name=scripts_pvc_name, namespace="default")
-    except:
-        pass
-    
-    try:
-        v1.delete_namespaced_persistent_volume_claim(name=output_pvc_name, namespace="default")
-    except:
-        pass
 
 @app.post("/student/validate")
 async def validate_student_task(
@@ -467,24 +454,37 @@ async def validate_student_task(
     student_dir = create_student_directory(student_name)
     task_dir = create_task_directory(task_name)
     
-    # Save the student's script
-    script_path = task_dir / f"{student_name}_script.py"
-    with open(script_path, "wb") as buffer:
+    # Save the student's script to shared input
+    shared_input_dir = Path(f"/shared/input/{task_name}/{student_name}")
+    shared_input_dir.mkdir(parents=True, exist_ok=True)
+    student_script_path = shared_input_dir / f"{student_name}_script.py"
+    with open(student_script_path, "wb") as buffer:
         shutil.copyfileobj(script_file.file, buffer)
     
-    # Create PVCs for this task
-    scripts_pvc_name, output_pvc_name = create_task_pvcs(task_name, student_name)
+    # Create shared PVC
+    shared_pvc_name = create_shared_pvc()
     
     # Create and start task pod
-    pod_name = create_task_pod(task_name, student_name, db, scripts_pvc_name, output_pvc_name)
+    pod_name = create_task_pod(task_name, student_name, db, shared_pvc_name)
     if not pod_name:
-        # Clean up PVCs if pod creation fails
-        delete_task_pvcs(scripts_pvc_name, output_pvc_name)
         raise HTTPException(status_code=500, detail="Failed to create task pod")
     
+    # Return information about the task
     return {
         "message": "Task validation started",
-        "pod_name": pod_name
+        "pod_name": pod_name,
+        "status_url": f"/student/task/status/{pod_name}"
+    }
+
+# Add a new endpoint to check task status
+@app.get("/student/task/status/{pod_name}")
+def get_task_status(pod_name: str):
+    status = check_task_pod_status(pod_name)
+    return {
+        "pod_name": pod_name,
+        "status": status["phase"],
+        "completed": status["completed"],
+        "result": status["result"]
     }
 
 @app.get("/student", response_model=APIInfo)
@@ -582,6 +582,22 @@ async def create_task(
     script_path = task_dir / "teacher_script.py"
     with open(script_path, "wb") as buffer:
         shutil.copyfileobj(script_file.file, buffer)
+    
+    # Create shared directories for the task
+    shared_script_dir = Path(f"/shared/input/{task_name}/script")
+    shared_script_dir.mkdir(parents=True, exist_ok=True)
+    
+    shared_teacher_dir = Path(f"/shared/input/{task_name}/teacher")
+    shared_teacher_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Copy teacher's script to shared directory
+    shutil.copy(str(script_path), str(shared_teacher_dir / "teacher_script.py"))
+    
+    # Copy the comparison script to shared script directory and make it executable
+    script_template_path = Path(__file__).parent / "script_template.sh"
+    compare_script_path = shared_script_dir / "compare_scripts.sh"
+    shutil.copy(str(script_template_path), str(compare_script_path))
+    compare_script_path.chmod(0o755)  # Make the script executable
     
     return {
         "message": "Task created successfully",

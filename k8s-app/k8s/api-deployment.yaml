@@ -49,7 +49,12 @@ spec:
           volumeMounts:
             - name: api-storage
               mountPath: /data
+            - name: shared-storage
+              mountPath: /shared
       volumes:
         - name: api-storage
           persistentVolumeClaim:
-            claimName: api-pvc 
+            claimName: api-pvc
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: shared-pvc 
