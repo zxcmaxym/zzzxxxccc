@@ -6,7 +6,7 @@ if [ -f port_forward.pid ]; then
   kill $(cat port_forward.pid) 2>/dev/null
   rm port_forward.pid
 fi
-
+kubectl get pods --no-headers -o custom-columns=":metadata.name" | grep '^task' | xargs kubectl delete pod
 # Delete and rebuild everything
 kubectl delete deployment api
 sleep 2

@@ -15,6 +15,7 @@ import time
 import asyncio
 import yaml
 import random
+from fastapi.responses import PlainTextResponse
 
 app = FastAPI()
 
@@ -357,6 +358,33 @@ def randomize_variables(task_name: str) -> List[int]:
     
     return random_values
 
+def update_task_result_status(task_id: int, student_id: int, task_name: str, student_name: str, db: Session) -> None:
+    """Update task result status based on validation output."""
+    result_dir = Path(f"/shared/output/{task_name}/{student_name}")
+    status_file = result_dir / "status.txt"
+    output_file = result_dir / "output.txt"
+    
+    if status_file.exists() and status_file.read_text().strip() == "COMPLETED":
+        # Read the output file to determine the final status
+        if output_file.exists():
+            output_content = output_file.read_text()
+            if "SUCCESS: Outputs match!" in output_content:
+                status = "SUCCESS"
+            elif "FAIL: Outputs do not match" in output_content:
+                status = "FAIL"
+            else:
+                status = "ERROR"
+            
+            # Update the task result in the database
+            task_result = db.query(TaskResult).filter(
+                TaskResult.task_id == task_id,
+                TaskResult.student_id == student_id
+            ).first()
+            
+            if task_result:
+                task_result.status = status
+                db.commit()
+
 @app.post("/student/validate")
 async def validate_student_task(
     student_name: str = Form(...),
@@ -463,7 +491,7 @@ async def validate_student_task(
         "result_url": f"/student/task/result/{task_name}/{student_name}"
     }
 
-@app.get("/student/task/result/{task_name}/{student_name}")
+@app.get("/student/task/result/{task_name}/{student_name}", response_class=PlainTextResponse)
 def get_task_result(task_name: str, student_name: str, db: Session = Depends(get_db)):
     # Validate student
     student = db.query(Student).filter(Student.name == student_name).first()
@@ -494,32 +522,22 @@ def get_task_result(task_name: str, student_name: str, db: Session = Depends(get
     ).order_by(TaskResult.created_at.desc()).first()
     
     if not task_result:
-        return {
-            "result": "NOT_STARTED",
-            "output": None
-        }
+        return "NOT_STARTED"
+    
+    # Update the status if validation is complete
+    update_task_result_status(task.id, student.id, task_name, student_name, db)
     
     # Read the output file
     output_path = Path(f"/shared/output/{task_name}/{student_name}/output.txt")
     if not output_path.exists():
-        return {
-            "result": task_result.status,
-            "output": None
-        }
+        return task_result.status
     
     try:
         with open(output_path, "r") as f:
             output_content = f.read()
-        return {
-            "result": task_result.status,  # SUCCESS, FAIL, ERROR, or NOT_STARTED
-            "output": output_content
-        }
+        return output_content
     except Exception as e:
-        return {
-            "result": task_result.status,
-            "output": None,
-            "error": str(e)
-        }
+        return f"Error reading output: {str(e)}"
 
 @app.get("/student", response_model=APIInfo)
 def get_student_info(name: str, db: Session = Depends(get_db)):
@@ -554,10 +572,19 @@ def get_student_info(name: str, db: Session = Depends(get_db)):
     # Format task information
     task_info = []
     for task in tasks:
+        # Update the status if validation is complete
+        update_task_result_status(task.id, student.id, task.name, name, db)
+        
+        # Get the updated status after running update_task_result_status
+        updated_result = db.query(TaskResult).filter(
+            TaskResult.task_id == task.id,
+            TaskResult.student_id == student.id
+        ).order_by(TaskResult.created_at.desc()).first()
+        
         task_info.append({
             "name": task.name,
             "description": task.description,
-            "result": result_map.get(task.id, "NOT_STARTED")  # SUCCESS, FAIL, ERROR, or NOT_STARTED
+            "result": updated_result.status if updated_result else result_map.get(task.id, "NOT_STARTED")  # Use updated status
         })
     
     return APIInfo(
@@ -624,6 +651,7 @@ async def create_task(
     group_names: List[str] = Form(...),
     script_file: UploadFile = File(...),
     variables_file: UploadFile = File(None),  # New optional file upload
+    find_file: UploadFile = File(None),  # New optional file upload for find.txt
     db: Session = Depends(get_db)
 ):
     # Validate teacher
@@ -665,6 +693,12 @@ async def create_task(
         with open(vars_path, "wb") as buffer:
             shutil.copyfileobj(variables_file.file, buffer)
     
+    # Save the find.txt file if provided
+    if find_file:
+        find_path = task_dir / "find.txt"
+        with open(find_path, "wb") as buffer:
+            shutil.copyfileobj(find_file.file, buffer)
+    
     # Create shared directories for the task
     shared_script_dir = Path(f"/shared/input/{task_name}/script")
     shared_script_dir.mkdir(parents=True, exist_ok=True)
@@ -674,6 +708,11 @@ async def create_task(
     
     # Copy teacher's script to shared directory
     shutil.copy(str(script_path), str(shared_teacher_dir / "teacher_script.py"))
+    
+    # Copy find.txt to shared directory if it exists
+    if find_file:
+        shared_find_path = shared_script_dir / "find.txt"
+        shutil.copy(str(find_path), str(shared_find_path))
     
     # Copy the comparison script to shared script directory and make it executable
     script_template_path = Path(__file__).parent / "script_template.sh"
@@ -734,11 +773,55 @@ def get_task_results(task: str, db: Session = Depends(get_db)):
     # Get all results for the task
     results = db.query(TaskResult).filter(TaskResult.task_id == task_obj.id).all()
     
-    return [{
-        "student_name": db.query(Student).filter(Student.id == r.student_id).first().name,
-        "result": r.status,  # SUCCESS, FAIL, ERROR, or NOT_STARTED
-        "created_at": r.created_at
-    } for r in results]
+    # Process each result to include output if available
+    processed_results = []
+    for r in results:
+        student = db.query(Student).filter(Student.id == r.student_id).first()
+        student_name = student.name if student else "Unknown"
+        
+        # Update the status if validation is complete
+        update_task_result_status(task_obj.id, student.id, task, student_name, db)
+        
+        # Get the output if available
+        output_path = Path(f"/shared/output/{task}/{student_name}/output.txt")
+        output_content = None
+        patterns_found = 0
+        total_patterns = 0
+        
+        if output_path.exists():
+            try:
+                with open(output_path, "r") as f:
+                    output_content = f.read()
+                    
+                    # Count patterns found
+                    if output_content:
+                        # Look for pattern search results
+                        pattern_section = output_content.split("PATTERN SEARCH:")[-1] if "PATTERN SEARCH:" in output_content else ""
+                        if pattern_section:
+                            # Count lines with "Pattern:" in them
+                            pattern_lines = [line.strip() for line in pattern_section.split("\n") if line.strip() and "Pattern:" in line]
+                            total_patterns = len(pattern_lines)
+                            # Only count lines that contain "FOUND" but NOT "NOT FOUND"
+                            patterns_found = sum(1 for line in pattern_lines if "FOUND" in line and "NOT FOUND" not in line)
+            except:
+                pass
+        
+        # Get the updated status after running update_task_result_status
+        updated_result = db.query(TaskResult).filter(
+            TaskResult.task_id == task_obj.id,
+            TaskResult.student_id == student.id
+        ).order_by(TaskResult.created_at.desc()).first()
+        
+        processed_results.append({
+            "student_name": student_name,
+            "result": updated_result.status if updated_result else r.status,  # Use updated status
+            "created_at": r.created_at,
+            "output": output_content,
+            "patterns_found": patterns_found,
+            "total_patterns": total_patterns
+        })
+    
+    return processed_results
 
 @app.delete("/teacher/task/delete/{task}")
 def delete_task(task: str, db: Session = Depends(get_db)):
@@ -810,11 +893,8 @@ def get_teacher_task(task: str, db: Session = Depends(get_db)):
     # Get task files
     task_files = [f.name for f in task_dir.iterdir() if f.is_file()]
     
-    # Count results
-    results_dir = RESULTS_DIR / task
-    result_count = 0
-    if results_dir.exists():
-        result_count = len([d for d in results_dir.iterdir() if d.is_dir()])
+    # Count results from database
+    result_count = db.query(TaskResult).filter(TaskResult.task_id == task_obj.id).count()
     
     return {
         "name": task,
@@ -831,11 +911,8 @@ def create_group(group_name: str = Form(...), teacher_name: str = Form(...), db:
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
     
-    # Check if group already exists
-    existing_group = db.query(Group).filter(
-        Group.name == group_name,
-        Group.teacher_id == teacher.id
-    ).first()
+    # Check if group already exists for any teacher
+    existing_group = db.query(Group).filter(Group.name == group_name).first()
     
     if existing_group:
         raise HTTPException(status_code=400, detail="A group with this name already exists")
@@ -852,20 +929,25 @@ def create_group(group_name: str = Form(...), teacher_name: str = Form(...), db:
     return {"message": "Group created successfully", "group_id": db_group.id}
 
 @app.post("/teacher/group/add-student")
-def add_student_to_group(student_group: StudentGroupBase, teacher_name: str, db: Session = Depends(get_db)):
+def add_student_to_group(
+    student_name: str = Form(...),
+    group_name: str = Form(...),
+    teacher_name: str = Form(...),
+    db: Session = Depends(get_db)
+):
     # Validate teacher
     teacher = db.query(Teacher).filter(Teacher.name == teacher_name).first()
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
     
     # Validate student
-    student = db.query(Student).filter(Student.name == student_group.student_name).first()
+    student = db.query(Student).filter(Student.name == student_name).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
     
     # Validate group
     group = db.query(Group).filter(
-        Group.name == student_group.group_name,
+        Group.name == group_name,
         Group.teacher_id == teacher.id
     ).first()
     if not group:

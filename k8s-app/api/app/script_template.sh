@@ -1,48 +1,55 @@
 #!/bin/bash
 
-# Create output directory
-mkdir -p "/shared/output/$TASK_NAME/$STUDENT_NAME"
+# Get task name and student name from environment variables
+TASK_NAME=$1
+STUDENT_NAME=$2
 
-# Check if vars.txt exists and is not empty
-VARS_FILE="/shared/input/$TASK_NAME/$STUDENT_NAME/vars.txt"
-if [ -s "$VARS_FILE" ]; then
-    # Run teacher's script with all inputs
-    TEACHER_OUTPUT=$(python3 "/shared/input/$TASK_NAME/teacher/teacher_script.py" < "$VARS_FILE" 2>&1)
-    TEACHER_EXIT_CODE=$?
-    
-    # Run student's script with all inputs
-    STUDENT_OUTPUT=$(python3 "/shared/input/$TASK_NAME/$STUDENT_NAME/${STUDENT_NAME}_script.py" < "$VARS_FILE" 2>&1)
-    STUDENT_EXIT_CODE=$?
+# Set up directories
+INPUT_DIR="/shared/input/$TASK_NAME"
+OUTPUT_DIR="/shared/output/$TASK_NAME/$STUDENT_NAME"
+mkdir -p $OUTPUT_DIR
+
+# Run teacher's script and capture output
+echo "Running teacher's script..."
+TEACHER_OUTPUT=$(python3 $INPUT_DIR/teacher/teacher_script.py 2>&1)
+TEACHER_EXIT_CODE=$?
+
+# Run student's script and capture output
+echo "Running student's script..."
+STUDENT_OUTPUT=$(python3 $INPUT_DIR/$STUDENT_NAME/${STUDENT_NAME}_script.py 2>&1)
+STUDENT_EXIT_CODE=$?
+
+# Write outputs to output.txt
+echo "TEACHER OUTPUT:" > $OUTPUT_DIR/output.txt
+echo "$TEACHER_OUTPUT" >> $OUTPUT_DIR/output.txt
+echo "" >> $OUTPUT_DIR/output.txt
+echo "STUDENT OUTPUT:" >> $OUTPUT_DIR/output.txt
+echo "$STUDENT_OUTPUT" >> $OUTPUT_DIR/output.txt
+echo "" >> $OUTPUT_DIR/output.txt
+
+# Compare outputs
+if [ "$TEACHER_OUTPUT" = "$STUDENT_OUTPUT" ]; then
+    echo "SUCCESS: Outputs match!" >> $OUTPUT_DIR/output.txt
+    echo "COMPLETED" > $OUTPUT_DIR/status.txt
 else
-    # Run teacher's script without input
-    TEACHER_OUTPUT=$(python3 "/shared/input/$TASK_NAME/teacher/teacher_script.py" 2>&1)
-    TEACHER_EXIT_CODE=$?
-
-    # Run student's script without input
-    STUDENT_OUTPUT=$(python3 "/shared/input/$TASK_NAME/$STUDENT_NAME/${STUDENT_NAME}_script.py" 2>&1)
-    STUDENT_EXIT_CODE=$?
+    echo "FAIL: Outputs do not match" >> $OUTPUT_DIR/output.txt
+    echo "COMPLETED" > $OUTPUT_DIR/status.txt
 fi
 
-# Compare outputs and write results
-{
-    echo "=== Teacher's Script Output ==="
-    echo "$TEACHER_OUTPUT"
-    echo -e "\n=== Student's Script Output ==="
-    echo "$STUDENT_OUTPUT"
-    echo -e "\n=== Comparison Results ==="
+# Check for patterns in find.txt if it exists
+if [ -f "$INPUT_DIR/script/find.txt" ]; then
+    echo "" >> $OUTPUT_DIR/output.txt
+    echo "PATTERN SEARCH:" >> $OUTPUT_DIR/output.txt
     
-    if [ $TEACHER_EXIT_CODE -ne 0 ]; then
-        echo "ERROR: Teacher's script failed with exit code $TEACHER_EXIT_CODE"
-    elif [ $STUDENT_EXIT_CODE -ne 0 ]; then
-        echo "ERROR: Student's script failed with exit code $STUDENT_EXIT_CODE"
-    elif [ "$TEACHER_OUTPUT" = "$STUDENT_OUTPUT" ]; then
-        echo "SUCCESS: Outputs match!"
-    else
-        echo "FAIL: Outputs do not match"
-        echo -e "\n=== Differences ==="
-        diff <(echo "$TEACHER_OUTPUT") <(echo "$STUDENT_OUTPUT")
-    fi
-} > "/shared/output/$TASK_NAME/$STUDENT_NAME/output.txt"
+    while IFS= read -r pattern; do
+        # Count occurrences of pattern in student's script
+        COUNT=$(grep -c "$pattern" "$INPUT_DIR/$STUDENT_NAME/${STUDENT_NAME}_script.py")
+        if [ $COUNT -gt 0 ]; then
+            echo "  Pattern: \"$pattern\" - FOUND ($COUNT occurrences)" >> $OUTPUT_DIR/output.txt
+        else
+            echo "  Pattern: \"$pattern\" - NOT FOUND" >> $OUTPUT_DIR/output.txt
+        fi
+    done < "$INPUT_DIR/script/find.txt"
+fi
 
-# Write completion status
-echo "COMPLETED" > "/shared/output/$TASK_NAME/$STUDENT_NAME/status.txt"
+echo "COMPLETED" > $OUTPUT_DIR/status.txt
