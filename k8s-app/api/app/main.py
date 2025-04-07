@@ -418,9 +418,6 @@ async def validate_student_task(
     if not task_groups:
         raise HTTPException(status_code=403, detail="You don't have access to this task")
     
-    # Generate random values for variables
-    random_values = randomize_variables(task_name)
-    
     # Check for existing results
     existing_result = db.query(TaskResult).filter(
         TaskResult.task_id == task.id,
@@ -467,11 +464,15 @@ async def validate_student_task(
     with open(student_script_path, "wb") as buffer:
         shutil.copyfileobj(script_file.file, buffer)
     
-    # Save random values to vars.txt in shared directory
-    if random_values:
-        vars_path = shared_input_dir / "vars.txt"
-        with open(vars_path, "w") as f:
-            f.write("\n".join(map(str, random_values)))
+    # Check for vars.txt in task directory and generate random values
+    task_vars_path = task_dir / "vars.txt"
+    if task_vars_path.exists():
+        random_values = randomize_variables(task_name)
+        if random_values:
+            # Save random values to student's vars.txt
+            student_vars_path = shared_input_dir / "vars.txt"
+            with open(student_vars_path, "w") as f:
+                f.write("\n".join(map(str, random_values)))
     
     # Create shared PVC
     shared_pvc_name = create_shared_pvc()

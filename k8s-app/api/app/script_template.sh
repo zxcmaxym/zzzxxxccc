@@ -1,23 +1,43 @@
 #!/bin/bash
 
 # Get task name and student name from environment variables
-TASK_NAME=$1
-STUDENT_NAME=$2
+TASK_NAME=${TASK_NAME}
+STUDENT_NAME=${STUDENT_NAME}
+
+# Validate environment variables
+if [ -z "$TASK_NAME" ] || [ -z "$STUDENT_NAME" ]; then
+    echo "Error: TASK_NAME and STUDENT_NAME environment variables must be set"
+    exit 1
+fi
 
 # Set up directories
 INPUT_DIR="/shared/input/$TASK_NAME"
 OUTPUT_DIR="/shared/output/$TASK_NAME/$STUDENT_NAME"
 mkdir -p $OUTPUT_DIR
 
-# Run teacher's script and capture output
-echo "Running teacher's script..."
-TEACHER_OUTPUT=$(python3 $INPUT_DIR/teacher/teacher_script.py 2>&1)
-TEACHER_EXIT_CODE=$?
+# Check for vars.txt in student's directory
+VARS_FILE="/shared/input/$TASK_NAME/$STUDENT_NAME/vars.txt"
+if [ -s "$VARS_FILE" ]; then
+    # Run teacher's script with all inputs
+    echo "Running teacher's script with vars.txt..."
+    TEACHER_OUTPUT=$(python3 "$INPUT_DIR/teacher/teacher_script.py" < "$VARS_FILE" 2>&1)
+    TEACHER_EXIT_CODE=$?
+    
+    # Run student's script with all inputs
+    echo "Running student's script with vars.txt..."
+    STUDENT_OUTPUT=$(python3 "$INPUT_DIR/$STUDENT_NAME/${STUDENT_NAME}_script.py" < "$VARS_FILE" 2>&1)
+    STUDENT_EXIT_CODE=$?
+else
+    # Run teacher's script without input
+    echo "Running teacher's script..."
+    TEACHER_OUTPUT=$(python3 "$INPUT_DIR/teacher/teacher_script.py" 2>&1)
+    TEACHER_EXIT_CODE=$?
 
-# Run student's script and capture output
-echo "Running student's script..."
-STUDENT_OUTPUT=$(python3 $INPUT_DIR/$STUDENT_NAME/${STUDENT_NAME}_script.py 2>&1)
-STUDENT_EXIT_CODE=$?
+    # Run student's script without input
+    echo "Running student's script..."
+    STUDENT_OUTPUT=$(python3 "$INPUT_DIR/$STUDENT_NAME/${STUDENT_NAME}_script.py" 2>&1)
+    STUDENT_EXIT_CODE=$?
+fi
 
 # Write outputs to output.txt
 echo "TEACHER OUTPUT:" > $OUTPUT_DIR/output.txt
